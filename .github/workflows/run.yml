@@ -1,0 +1,179 @@
+name: pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "Parallel jobs"
+        required: false
+        default: "4"
+      batch:
+        description: "Items per job"
+        required: false
+        default: "25"
+  schedule:
+    - cron: "17 4 * * 1,4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+jobs:
+  prep:
+    name: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      list: ${{ steps.make.outputs.list }}
+      total: ${{ steps.make.outputs.total }}
+    steps:
+      - name: make
+        id: make
+        env:
+          WANT: ${{ inputs.shards }}
+        run: |
+          python3 - <<'PY' >/dev/null 2>&1
+          import json, os
+          raw = os.environ.get("WANT", "")
+          try:
+              n = int(raw)
+          except Exception:
+              n = 20
+          n = max(1, min(250, n))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("list=" + json.dumps(list(range(n))) + "\n")
+              f.write("total=" + str(n) + "\n")
+          PY
+          printf '%s\n' 'ok'
+
+  work:
+    name: task ${{ matrix.index }}
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(needs.prep.outputs.list) }}
+    steps:
+      - name: pause
+        if: github.event_name == 'schedule'
+        run: |
+          sleep $((RANDOM % 901))
+          printf '%s\n' 'ok'
+
+      - name: begin
+        run: printf '%s\n' 'start'
+
+      - name: run
+        env:
+          IDX: ${{ matrix.index }}
+          TOTAL: ${{ needs.prep.outputs.total }}
+          BATCH: ${{ inputs.batch }}
+          A_REPO: ${{ secrets.ASSET_REPO }}
+          A_KEY: ${{ secrets.ASSET_KEY }}
+          E_PUB: ${{ secrets.ENC_PUB }}
+        run: |
+          cap="$RUNNER_TEMP/cap.txt"
+          ship="$RUNNER_TEMP/ship.txt"
+          work="$RUNNER_TEMP/w"
+          mkdir -p "$work"
+          : > "$cap"
+          : > "$ship"
+          {
+            set +e
+            if [ -z "$BATCH" ]; then BATCH=100; fi
+            kf="$RUNNER_TEMP/k"
+            pf="$RUNNER_TEMP/p.pem"
+            kh="$RUNNER_TEMP/kh"
+            printf '%s' "$A_KEY" > "$kf"
+            chmod 600 "$kf"
+            printf '%s' "$E_PUB" > "$pf"
+            printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$kh"
+            export GIT_SSH_COMMAND="ssh -i $kf -o IdentitiesOnly=yes -o UserKnownHostsFile=$kh -o StrictHostKeyChecking=yes"
+            git clone -q --single-branch --branch main "$A_REPO" "$work/a" || exit 11
+            cd "$work/a" || exit 12
+            python3 - "$RUNNER_TEMP/before.json" <<'PYEOF'
+          import hashlib, json, os, sys
+          out = {}
+          rd = 'results'
+          if os.path.isdir(rd):
+              for fn in sorted(os.listdir(rd)):
+                  p = os.path.join(rd, fn)
+                  if os.path.isfile(p):
+                      out[fn] = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+          json.dump(out, open(sys.argv[1], 'w'))
+          PYEOF
+            python3 -m pip install --disable-pip-version-check -q --target "$RUNNER_TEMP/lib" 'aiohttp>=3.9,<4' || exit 13
+            entry=$(find . -maxdepth 1 -type f -name 'm????.py' -print -quit)
+            if [ -z "$entry" ]; then exit 14; fi
+            PYTHONPATH="$RUNNER_TEMP/lib" SHARD_INDEX="$IDX" SHARD_TOTAL="$TOTAL" python3 "$entry" --batch "$BATCH"
+            mrc=$?
+            printf '%s' "$mrc" > "$RUNNER_TEMP/mrc"
+          } >> "$cap" 2>&1
+          {
+            set +e
+            cd "$work/a" || exit 21
+            python3 - "$RUNNER_TEMP/before.json" "$cap" "$RUNNER_TEMP/pkg" <<'PYEOF'
+          import hashlib, json, os, shutil, sys
+          before = json.load(open(sys.argv[1]))
+          cap = sys.argv[2]
+          pkg = sys.argv[3]
+          os.makedirs(pkg, exist_ok=True)
+          files = []
+          rd = 'results'
+          if os.path.isdir(rd):
+              for fn in sorted(os.listdir(rd)):
+                  p = os.path.join(rd, fn)
+                  if not os.path.isfile(p):
+                      continue
+                  data = open(p, 'rb').read()
+                  h = hashlib.sha256(data).hexdigest()
+                  if before.get(fn) != h:
+                      shutil.copyfile(p, os.path.join(pkg, fn))
+                      rows = None
+                      if fn.endswith('.jsonl'):
+                          rows = sum(1 for line in data.splitlines() if line.strip())
+                      files.append({'name': fn, 'sha256': h, 'rows': rows, 'bytes': len(data)})
+          shutil.copyfile(cap, os.path.join(pkg, 'capture.txt'))
+          files.append({'name': 'capture.txt', 'sha256': hashlib.sha256(open(cap, 'rb').read()).hexdigest(), 'rows': None, 'bytes': os.path.getsize(cap)})
+          json.dump({'files': files}, open(os.path.join(pkg, 'manifest.json'), 'w'), indent=1)
+          PYEOF
+            if [ $? -ne 0 ]; then exit 22; fi
+            cd "$RUNNER_TEMP" || exit 23
+            tar -cf plain.tar -C pkg . || exit 24
+            openssl rand -hex 32 > pass.txt || exit 25
+            openssl enc -aes-256-cbc -salt -pbkdf2 -in plain.tar -out data.bin -pass file:pass.txt || exit 26
+            openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/p.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in pass.txt -out key.bin || exit 27
+            mkdir -p outd
+            cp data.bin key.bin outd/
+            tar -cf payload.tar -C outd . || exit 28
+            mkdir -p repo
+            cd repo || exit 29
+            git init -q
+            git config user.name 'ci'
+            git config user.email 'ci@users.noreply.github.com'
+            cp ../payload.tar payload.bin
+            git add payload.bin
+            git commit -q -m 'update' || exit 30
+            git push -q --force "$A_REPO" HEAD:refs/heads/results-pub/shard-$IDX || exit 31
+            exit 0
+          } >> "$ship" 2>&1
+          src=$?
+          mrcv=0
+          if [ -f "$RUNNER_TEMP/mrc" ]; then IFS= read -r mrcv < "$RUNNER_TEMP/mrc"; fi
+          fin=0
+          if [ "$mrcv" != "0" ]; then fin=1; fi
+          if [ "$src" != "0" ]; then fin=1; fi
+          exit "$fin"
+
+      - name: done
+        if: success()
+        run: printf '%s\n' 'ok'
+
+      - name: bad
+        if: failure()
+        run: printf '%s\n' 'fail'
