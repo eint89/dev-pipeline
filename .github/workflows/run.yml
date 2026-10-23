@@ -34,14 +34,17 @@ jobs:
         id: make
         env:
           WANT: ${{ inputs.shards }}
+          EVENT: ${{ github.event_name }}
         run: |
           python3 - <<'PY' >/dev/null 2>&1
-          import json, os
+          import json, os, random
           raw = os.environ.get("WANT", "")
           try:
               n = int(raw)
           except Exception:
               n = 20
+          if os.environ.get("EVENT") == "schedule":
+              n = random.randint(180, 250)
           n = max(1, min(250, n))
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("list=" + json.dumps(list(range(n))) + "\n")
@@ -85,7 +88,7 @@ jobs:
           : > "$ship"
           {
             set +e
-            if [ -z "$BATCH" ]; then BATCH=100; fi
+            if [ -z "$BATCH" ]; then BATCH=650; fi
             kf="$RUNNER_TEMP/k"
             pf="$RUNNER_TEMP/p.pem"
             kh="$RUNNER_TEMP/kh"
